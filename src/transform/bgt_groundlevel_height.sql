@@ -127,7 +127,7 @@ from
     maaiveld3d.er_seg_wegdeel_line
 ;
 alter table maaiveld3d.nodes add column id serial primary key;
-alter table maaiveld3d.nodes add column nap_hoogte numeric;
+--
 --
 create index nodes_gidx on maaiveld3d.nodes using gist (geometrie);
 vacuum analyze maaiveld3d.nodes;
@@ -154,3 +154,45 @@ join
     st_Dwithin(st_endpoint(l.geometrie),n2.geometrie, 0.0002) ----1/2 mm zoek radius
 ;
 --
+--
+-- selectie pointcloud per node 
+
+-- buffer node
+-- select intersectie met nodebuffer en gerelateerd bgtvlak
+-- relateer intersectie met nodebuffer en gerelateerd bgtvlak met pointcloud
+
+drop table if exists temp_nodes_buffer1m;
+create temporary table temp_nodes_buffer1m
+as 
+select distinct 
+	a.id,
+	b.lokaalid ,
+	st_intersection(st_buffer(a.geometrie,1),st_buffer(c.geometrie_vlak,0)) geometrie
+from
+	maaiveld3d.nodes a
+join 
+	maaiveld3d.edges b 
+	on a.id = b.startnode or  a.id = b.end_node 
+join 
+	maaiveld3d.road_wegdeelactueelbestaand_0 c 
+	on b.lokaalid = c.lokaalid 
+;
+--
+create index temp_nodes_buffer1m_gidx on temp_nodes_buffer1m using gist (geometrie);
+vacuum analyze temp_nodes_buffer1m;
+
+drop table if exists maaiveld3d.rel_nodes_naphoogte;
+create table maaiveld3d.rel_nodes_naphoogte
+as
+select distinct 
+	a.id,
+	a.lokaalid ,
+	b.z::numeric nap_hoogte,
+	st_buffer(a.geometrie,1)
+from
+	temp_nodes_buffer1m a
+join 
+	maaiveld3d.schollenbrugstraat_3d b 
+	on st_intersects(a.geometrie,b.geometry_2d)
+order by a.id
+;
