@@ -126,9 +126,12 @@ select
 from
     maaiveld3d.er_seg_wegdeel_line
 ;
-alter table nodes add column id serial primary key;
-alter table nodes add column nap_hoogte numeric;
+alter table maaiveld3d.nodes add column id serial primary key;
+alter table maaiveld3d.nodes add column nap_hoogte numeric;
 --
+create index nodes_gidx on maaiveld3d.nodes using gist (geometrie);
+vacuum analyze maaiveld3d.nodes;
+-- nodes relateren aan de lines, subelements en bgt_objecten
 --
 --tussen tabel voor opbouwen topologie: edges
 drop table if exists maaiveld3d.edges;
