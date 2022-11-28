@@ -1,5 +1,5 @@
 --
--- deriive outer ring from polygons
+-- derive outer ring from polygons
 drop table if exists maaiveld3d.road_wegdeelactueelbestaand_er;
 create table maaiveld3d.road_wegdeelactueelbestaand_er 
 as
@@ -81,32 +81,98 @@ alter table  maaiveld3d.road_wegdeelactueelbestaand_er
 add column element_id serial primary key;
 vacuum analyze maaiveld3d.road_wegdeelactueelbestaand_er;
 
+
+-- create table to clip the lines (blade)
+drop table if exists maaiveld3d.tmp_stg_blade;
+create table maaiveld3d.tmp_stg_blade
+as 
+select distinct 
+    lokaalid,
+    element_id,
+    bladepoints
+from (
+select
+    lokaalid,
+    element_id,
+    case 
+        when st_length(exteriorring) > 2
+            then ST_LineInterpolatePoints(exteriorring, (1/st_length(exteriorring))) 
+            else ST_LineInterpolatePoints(exteriorring, (0.05/st_length(exteriorring)))
+        end bladepoints --om de 1 m (mes=blade)
+from
+    maaiveld3d.road_wegdeelactueelbestaand_er -- extrior ring
+) blade 
+;
+--
+create index tmp_stg_blade_gidx on maaiveld3d.tmp_stg_blade using gist (bladepoints);
+alter table maaiveld3d.tmp_stg_blade add column id serial PRIMARY key;
+vacuum analyze maaiveld3d.tmp_stg_blade;
+--
+-- add vertexpoints to the blade 
+drop table if exists tmp_vertexpoints;
+create temporary table tmp_vertexpoints 
+as 
+with vertexpoints as (
+select distinct
+    lokaalid,
+    element_id,
+    (ST_DumpPoints(exteriorring)).geom bladepoints
+from
+    maaiveld3d.road_wegdeelactueelbestaand_er) 
+--
+select distinct
+    a.lokaalid,
+    a.element_id,
+    a.bladepoints
+from 
+	vertexpoints a
+left join 
+	maaiveld3d.tmp_stg_blade b
+	on st_DWithin(a.bladepoints, b.bladepoints,0.001) 
+where 
+	coalesce(a.bladepoints <-> b.bladepoints,1) > 0.001
+;
+--
+insert into maaiveld3d.tmp_stg_blade
+select * from tmp_vertexpoints;
+--
+--
+-- again, remove duplicate points and union points
+drop table if exists maaiveld3d.tmp_blade;
+create table maaiveld3d.tmp_blade
+as 
+select 
+    lokaalid,
+    element_id,
+    st_union(bladepoints) bladepoints
+from (
+select
+distinct on (lokaalid,element_id,bladepoints)
+    lokaalid,
+    element_id,
+    bladepoints
+from maaiveld3d.tmp_stg_blade
+) multi 
+group by 
+    lokaalid,
+    element_id 
+;
+--
+create index tmp_blade_gidx on maaiveld3d.tmp_blade using gist (bladepoints);
+vacuum analyze maaiveld3d.tmp_blade;
+--
+--
 -- segment exterior ring by 1 meter
 drop table if exists maaiveld3d.er_seg_wegdeel_line;
 create table maaiveld3d.er_seg_wegdeel_line as
 --let op curve defaults vanuit bgt landelijke voorziening! st_split maakt hier bruikbare lijnstukken van.
-with mper as (
-                select
-                    lokaalid,
-                    element_id,
-                    case 
-                        when st_length(exteriorring) > 2
-                            then ST_LineInterpolatePoints(exteriorring, (1/st_length(exteriorring))) 
-                            else ST_LineInterpolatePoints(exteriorring, (0.05/st_length(exteriorring)))
-                        end bladepoints --om de 1 m (mes=blade)
-                from
-                    maaiveld3d.road_wegdeelactueelbestaand_er -- extrior ring
-                where 1=1
-                )
-select 
+select distinct
     er.lokaalid,
     er.element_id, 
     (st_dump(st_split(st_snap(er.exteriorring, mper.bladepoints,0.002),mper.bladepoints))).geom as geometrie
 from maaiveld3d.road_wegdeelactueelbestaand_er er
-join mper
+join maaiveld3d.tmp_blade mper
     on  er.lokaalid = mper.lokaalid and er.element_id = mper.element_id
-where 1=1
---and er.lokaalid = 'G0363.29bbe83355844a42b5927950ffc6aa18'
 ;
 --
 alter table maaiveld3d.er_seg_wegdeel_line add column id serial primary key;--
@@ -114,7 +180,7 @@ alter table maaiveld3d.er_seg_wegdeel_line add column start_node int;--
 alter table maaiveld3d.er_seg_wegdeel_line add column end_node int;--
 --
 --
---tussen tabel voor opbouwen topologie: nodes
+-- tabel voor opbouwen locale topologie: nodes
 drop table if exists maaiveld3d.nodes;
 create table maaiveld3d.nodes as
 select 
@@ -133,7 +199,7 @@ create index nodes_gidx on maaiveld3d.nodes using gist (geometrie);
 vacuum analyze maaiveld3d.nodes;
 -- nodes relateren aan de lines, subelements en bgt_objecten
 --
---tussen tabel voor opbouwen topologie: edges
+--tussentabel voor opbouwen topologie: edges
 drop table if exists maaiveld3d.edges;
 create table maaiveld3d.edges as
 select
@@ -141,6 +207,7 @@ select
     st_length(l.geometrie) as lengte,
     l.geometrie,
     l.id as line_id,
+    l.element_id,
     n1.id as startnode,
     n2.id as end_node
 from
@@ -154,45 +221,3 @@ join
     st_Dwithin(st_endpoint(l.geometrie),n2.geometrie, 0.0002) ----1/2 mm zoek radius
 ;
 --
---
--- selectie pointcloud per node 
-
--- buffer node
--- select intersectie met nodebuffer en gerelateerd bgtvlak
--- relateer intersectie met nodebuffer en gerelateerd bgtvlak met pointcloud
-
-drop table if exists temp_nodes_buffer1m;
-create temporary table temp_nodes_buffer1m
-as 
-select distinct 
-	a.id,
-	b.lokaalid ,
-	st_intersection(st_buffer(a.geometrie,1),st_buffer(c.geometrie_vlak,0)) geometrie
-from
-	maaiveld3d.nodes a
-join 
-	maaiveld3d.edges b 
-	on a.id = b.startnode or  a.id = b.end_node 
-join 
-	maaiveld3d.road_wegdeelactueelbestaand_0 c 
-	on b.lokaalid = c.lokaalid 
-;
---
-create index temp_nodes_buffer1m_gidx on temp_nodes_buffer1m using gist (geometrie);
-vacuum analyze temp_nodes_buffer1m;
-
-drop table if exists maaiveld3d.rel_nodes_naphoogte;
-create table maaiveld3d.rel_nodes_naphoogte
-as
-select distinct 
-	a.id,
-	a.lokaalid ,
-	b.z::numeric nap_hoogte,
-	st_buffer(a.geometrie,1)
-from
-	temp_nodes_buffer1m a
-join 
-	maaiveld3d.schollenbrugstraat_3d b 
-	on st_intersects(a.geometrie,b.geometry_2d)
-order by a.id
-;
